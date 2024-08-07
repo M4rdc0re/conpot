@@ -3,7 +3,7 @@
 
 import logging
 
-from pysmi.reader import FileReader, FtpReader
+from pysmi.reader import FileReader
 from pysnmp.entity import config
 from pysnmp.entity.rfc3413 import context
 from pysnmp.carrier.asynsock.dgram import udp
@@ -47,6 +47,7 @@ class SNMPDispatcher(DatagramServer):
 
 class CommandResponder(object):
     def __init__(self, host, port, raw_mibs, compiled_mibs):
+
         self.oid_mapping = {}
         self.databus_mediator = DatabusMediator(self.oid_mapping)
         # mapping between OID and databus keys
@@ -58,9 +59,6 @@ class CommandResponder(object):
         mib_builder = self.snmpEngine.getMibBuilder()
         addMibCompiler(mib_builder, destination=compiled_mibs)
         mib_builder.getMibCompiler().addSources(FileReader(raw_mibs))
-        mib_builder.getMibCompiler().addSources(
-            FtpReader("ftp.cisco.com", "/pub/mibs/v2/@mib@", 80)
-        )
 
         # Transport setup
         udp_sock = gevent.socket.socket(gevent.socket.AF_INET, gevent.socket.SOCK_DGRAM)
@@ -172,10 +170,10 @@ class CommandResponder(object):
         if s:
             self.oid_mapping[s.name + instance] = profile_map_name
 
-            (MibScalarInstance,) = (
-                self.snmpEngine.msgAndPduDsp.mibInstrumController.mibBuilder.importSymbols(
-                    "SNMPv2-SMI", "MibScalarInstance"
-                )
+            (
+                MibScalarInstance,
+            ) = self.snmpEngine.msgAndPduDsp.mibInstrumController.mibBuilder.importSymbols(
+                "SNMPv2-SMI", "MibScalarInstance"
             )
             x = MibScalarInstance(s.name, instance, s.syntax.clone(value))
             self.snmpEngine.msgAndPduDsp.mibInstrumController.mibBuilder.exportSymbols(
