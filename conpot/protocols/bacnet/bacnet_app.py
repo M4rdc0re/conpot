@@ -21,6 +21,11 @@
 import logging
 import re
 import sys
+
+from bacpypes.bvll import BVLPDU, OriginalUnicastNPDU, OriginalBroadcastNPDU
+from bacpypes.errors import ExecutionError
+from bacpypes.npdu import NPDU
+from bacpypes.pdu import Address as PduAddress
 from bacpypes.pdu import GlobalBroadcast
 import bacpypes.object
 from bacpypes.app import BIPSimpleApplication
@@ -38,9 +43,15 @@ from bacpypes.apdu import (
     ReadPropertyACK,
     ConfirmedServiceChoice,
     UnconfirmedServiceChoice,
+    Error,
+    ReadPropertyMultipleACK,
+    ReadAccessResult,
+    ReadAccessResultElement,
+    ReadAccessResultElementChoice
 )
 from bacpypes.pdu import PDU
-import ast
+from bacpypes.service import object as BacpypesServiceObject
+from bacpypes.basetypes import ErrorType
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +81,7 @@ class BACnetApp(BIPSimpleApplication):
         """
         parse the bacnet template for objects and their properties
         """
-        self.deviceIdentifier = int(dom.xpath("//bacnet/device_info/*")[1].text)
+        self.deviceIdentifier = ("device", int(dom.xpath("//bacnet/device_info/*")[1].text))
         device_property_list = dom.xpath("//bacnet/device_info/*")
         for prop in device_property_list:
             prop_key = prop.tag.lower().title()
@@ -105,7 +116,13 @@ class BACnetApp(BIPSimpleApplication):
                     prop_val = prop.text.lower().title()
                     prop_val = re.sub(" ", "", prop_val)
                     prop_val = prop_val[0].lower() + prop_val[1:]
-                prop_val = prop.text
+                elif prop_key == "presentValue":
+                    try:
+                        prop_val = float(prop.text)
+                    except ValueError:
+                        prop_val = prop.text
+                else:
+                    prop_val = prop.text
                 try:
                     if prop_key == "objectIdentifier":
                         device_object.objectIdentifier = int(prop_val)
@@ -174,7 +191,9 @@ class BACnetApp(BIPSimpleApplication):
         if execute:
             self._response_service = "IAmRequest"
             self._response = IAmRequest()
-            self._response.pduDestination = GlobalBroadcast()
+            # todo make possible to use both GlobalBroadcast or Unicast address
+            # self._response.pduDestination = GlobalBroadcast()
+            self._response.pduDestination = PduAddress(address)
             self._response.iAmDeviceIdentifier = self.deviceIdentifier
             # self._response.objectIdentifier = list(self.objectIdentifier.keys())[0][1]
             self._response.maxAPDULengthAccepted = int(
@@ -213,7 +232,9 @@ class BACnetApp(BIPSimpleApplication):
                     objName = self.objectIdentifier[obj].objectName
                     self._response_service = "IHaveRequest"
                     self._response = IHaveRequest()
-                    self._response.pduDestination = GlobalBroadcast()
+                    # todo make possible to use both GlobalBroadcast or Unicast address
+                    # self._response.pduDestination = GlobalBroadcast()
+                    self._response.pduDestination = PduAddress(address)
                     # self._response.deviceIdentifier = list(self.objectIdentifier.keys())[0][1]
                     self._response.deviceIdentifier = self.deviceIdentifier
                     self._response.objectIdentifier = obj[1]
@@ -224,50 +245,207 @@ class BACnetApp(BIPSimpleApplication):
 
     def readProperty(self, request, address, invoke_key, device):
         # Read Property
-        # TODO: add support for PropertyArrayIndex handling;
-        for obj in device.objectList.value[2:]:
+        # TODO: add support/testing for PropertyArrayIndex handling;
+        for obj in device.objectList.value[1:]:
             if (
-                int(request.objectIdentifier[1]) == obj[1]
+                (int(request.objectIdentifier[1]) == 4194303 or int(request.objectIdentifier[1]) == obj[1])
                 and request.objectIdentifier[0] == obj[0]
             ):
-                objName = self.objectIdentifier[obj].objectName
-                for prop in self.objectIdentifier[obj].properties:
-                    if request.propertyIdentifier == prop.identifier:
-                        propName = prop.identifier
-                        propValue = prop.ReadProperty(self.objectIdentifier[obj])
-                        propType = prop.datatype()
-                        self._response_service = "ComplexAckPDU"
-                        self._response = ReadPropertyACK()
-                        self._response.pduDestination = address
-                        self._response.apduInvokeID = invoke_key
-                        self._response.objectIdentifier = obj[1]
-                        self._response.objectName = objName
-                        self._response.propertyIdentifier = propName
+                # check if it is a root device or something from object list
+                if obj in self.objectIdentifier:
 
-                        # get the property type
-                        for p in dir(sys.modules[propType.__module__]):
-                            _obj = getattr(sys.modules[propType.__module__], p)
-                            try:
-                                if type(propType) == _obj:
-                                    break
-                            except TypeError:
-                                pass
-                        value = ast.literal_eval(propValue)
-                        self._response.propertyValue = Any(_obj(value))
-                        # self._response.propertyValue.cast_in(objPropVal)
-                        # self._response.debug_contents()
-                        break
-                else:
-                    logger.info(
-                        "Bacnet ReadProperty: object has no property %s",
-                        request.propertyIdentifier,
-                    )
-                    self._response = ErrorPDU()
-                    self._response.pduDestination = address
+                    # getting properties from objects in object list (self.objectIdentifier)
+                    try:
+                        property_value = BacpypesServiceObject.read_property_to_any(self.objectIdentifier[obj],
+                                                                                    request.propertyIdentifier,
+                                                                                    request.propertyArrayIndex)
+                    except ExecutionError as e:
+                        # return empty string instead of error unknownProperty
+                        if e.errorCode == "unknownProperty":
+                            datatype = self.objectIdentifier[obj].get_datatype(request.propertyIdentifier)
+                            property_value = Any()
+                            property_value.cast_in(datatype(None))
+                        else:
+                            self._response = Error(errorClass=e.errorClass, errorCode=e.errorCode, context=request)
+                            break
+
+                    self._response_service = "ComplexAckPDU"
+                    self._response = ReadPropertyACK()
+                    self._response.pduDestination = PduAddress(address)
                     self._response.apduInvokeID = invoke_key
-                    self._response.apduService = 0x0C
-                    # self._response.errorClass
-                    # self._response.errorCode
+                    self._response.objectIdentifier = obj
+                    self._response.objectName = self.objectIdentifier[obj].objectName
+                    self._response.propertyIdentifier = request.propertyIdentifier
+                    self._response.propertyValue = property_value
+                    break
+                else:
+                    # getting properties from root device (self.localDevice)
+                    try:
+                        property_value = BacpypesServiceObject.read_property_to_any(self.localDevice,
+                                                                                    request.propertyIdentifier,
+                                                                                    request.propertyArrayIndex)
+                    except ExecutionError as e:
+                        # return empty/None instead of error unknownProperty
+                        if e.errorCode == "unknownProperty":
+                            datatype = self.localDevice.get_datatype(request.propertyIdentifier)
+                            property_value = Any()
+                            property_value.cast_in(datatype(None))
+                        else:
+                            self._response = Error(errorClass=e.errorClass, errorCode=e.errorCode, context=request)
+                            break
+
+                    self._response_service = "ComplexAckPDU"
+                    self._response = ReadPropertyACK()
+                    self._response.pduDestination = PduAddress(address)
+                    self._response.apduInvokeID = invoke_key
+                    self._response.objectIdentifier = obj
+                    # self._response.objectName = ""
+                    self._response.propertyIdentifier = request.propertyIdentifier
+                    self._response.propertyValue = property_value
+                    break
+
+        else:
+            logger.info(
+                "Bacnet ReadProperty: object %s doesn't exist",
+                request.objectIdentifier[0],
+            )
+            self._response = Error(errorClass="object", errorCode="unknownObject", context=request)
+
+    def readPropertyMultiple(self, request, address, invoke_key, device):
+        # Respond to a ReadPropertyMultiple Request.
+
+        # response is a list of read access results (or an error)
+        read_access_result_list = []
+
+        # loop through the request
+        for read_access_spec in request.listOfReadAccessSpecs:
+            # get the object identifier
+            objectIdentifier = read_access_spec.objectIdentifier
+
+            obj = None
+            # check for wildcard
+            if (objectIdentifier == ('device', 4194303) or objectIdentifier == self.localDevice.objectIdentifier) and self.localDevice is not None:
+                objectIdentifier = self.localDevice.objectIdentifier
+                obj = self.localDevice
+            else:
+                # get the object
+                for device_obj in device.objectList.value[2:]:
+                    if objectIdentifier == device_obj:
+                        obj = self.objectIdentifier[device_obj]
+                        break
+
+            # build a list of result elements
+            read_access_result_element_list = []
+
+            # loop through the property references
+            for prop_reference in read_access_spec.listOfPropertyReferences:
+                # get the property identifier
+                propertyIdentifier = prop_reference.propertyIdentifier
+
+                # get the array index (optional)
+                propertyArrayIndex = prop_reference.propertyArrayIndex
+
+                # check for special property identifiers
+                if propertyIdentifier in ('all', 'required', 'optional'):
+                    if not obj:
+                        # build a property access error
+                        read_result = ReadAccessResultElementChoice()
+                        read_result.propertyAccessError = ErrorType(errorClass='object', errorCode='unknownObject')
+
+                        # make an element for this error
+                        read_access_result_element = ReadAccessResultElement(
+                            propertyIdentifier=propertyIdentifier,
+                            propertyArrayIndex=propertyArrayIndex,
+                            readResult=read_result,
+                        )
+
+                        # add it to the list
+                        read_access_result_element_list.append(read_access_result_element)
+                    else:
+                        for propId, prop in obj._properties.items():
+
+                            # skip propertyList for ReadPropertyMultiple
+                            if (propId == 'propertyList'):
+                                continue
+
+                            if (propertyIdentifier == 'all'):
+                                pass
+                            elif (propertyIdentifier == 'required') and (prop.optional):
+                                continue
+                            elif (propertyIdentifier == 'optional') and (not prop.optional):
+                                continue
+
+                            try:
+                                # read the specific property
+                                read_access_result_element = BacpypesServiceObject.read_property_to_result_element(obj,
+                                                                                                                   propId,
+                                                                                                                   propertyArrayIndex)
+                            except Exception as e:
+                                logger.exception("Bacnet exception in readPropertyMultiple")
+                                # build a property access error
+                                read_result = ReadAccessResultElementChoice()
+                                read_result.propertyAccessError = ErrorType(errorClass='object',
+                                                                            errorCode='unknownObject')
+
+                                # make an element for this error
+                                read_access_result_element = ReadAccessResultElement(
+                                    propertyIdentifier=propId,
+                                    propertyArrayIndex=propertyArrayIndex,
+                                    readResult=read_result,
+                                )
+
+                            # check for undefined property
+                            if read_access_result_element.readResult.propertyAccessError \
+                                    and read_access_result_element.readResult.propertyAccessError.errorCode == 'unknownProperty':
+                                continue
+
+                            # add it to the list
+                            read_access_result_element_list.append(read_access_result_element)
+
+                else:
+                    try:
+                        # read the specific property
+                        read_access_result_element = BacpypesServiceObject.read_property_to_result_element(obj, propertyIdentifier,
+                                                                                     propertyArrayIndex)
+                    except Exception as e:
+                        # better to respond with error than with nothing
+                        logger.exception("Bacnet exception in readPropertyMultiple")
+                        # build a property access error
+                        read_result = ReadAccessResultElementChoice()
+                        read_result.propertyAccessError = ErrorType(errorClass='object',
+                                                                    errorCode='unknownObject')
+
+                        # make an element for this error
+                        read_access_result_element = ReadAccessResultElement(
+                            propertyIdentifier=propertyIdentifier,
+                            propertyArrayIndex=propertyArrayIndex,
+                            readResult=read_result,
+                        )
+
+                    # check for undefined property
+                    if read_access_result_element.readResult.propertyAccessError \
+                            and read_access_result_element.readResult.propertyAccessError.errorCode == 'unknownProperty':
+                        continue
+                    # add it to the list
+                    read_access_result_element_list.append(read_access_result_element)
+
+            # build a read access result
+            read_access_result = ReadAccessResult(
+                objectIdentifier=objectIdentifier,
+                listOfResults=read_access_result_element_list
+            )
+
+            # add it to the list
+            read_access_result_list.append(read_access_result)
+
+        # this is a ReadPropertyMultiple ack:
+        self._response_service = "ComplexAckPDU"
+        self._response = ReadPropertyMultipleACK(context=request)
+        # self._response.pduDestination = PduAddress(address)
+        # self._response.apduInvokeID = invoke_key
+        # self._response.objectIdentifier = obj
+        # self._response.objectName = ""
+        self._response.listOfReadAccessResults = read_access_result_list
 
     def indication(self, apdu, address, device):
         """logging the received PDU type and Service request"""
@@ -351,7 +529,7 @@ class BACnetApp(BIPSimpleApplication):
                 )
                 self._response_service = "ErrorPDU"
                 self._response = ErrorPDU()
-                self._response.pduDestination = address
+                self._response.pduDestination = PduAddress(address)
                 return
         # ignore the following
         elif apdu_type.pduType == 0x2:
@@ -394,8 +572,26 @@ class BACnetApp(BIPSimpleApplication):
             return
         apdu = APDU()
         response_apdu.encode(apdu)
+        # add missing layers
+        # Network layer NPDU
+        npdu = NPDU()
+        apdu.encode(npdu)
+        pdu = PDU(user_data=npdu.pduUserData)
+        npdu.encode(pdu)
+        # Add Unicast or Broadcast NPDU
+        if pdu.pduDestination.addrType == PduAddress.localStationAddr:
+            # make an original unicast PDU
+            xpdu = OriginalUnicastNPDU(pdu, destination=pdu.pduDestination, user_data=pdu.pduUserData)
+        elif pdu.pduDestination.addrType == PduAddress.localBroadcastAddr:
+            # make an original broadcast PDU
+            xpdu = OriginalBroadcastNPDU(pdu, destination=pdu.pduDestination, user_data=pdu.pduUserData)
+        else:
+            raise RuntimeError("invalid destination address: {}".format(pdu.pduDestination))
+        # Bacnet Virtual Link
+        bvlpdu = BVLPDU()
+        xpdu.encode(bvlpdu)
         pdu = PDU()
-        apdu.encode(pdu)
+        bvlpdu.encode(pdu)
         if isinstance(response_apdu, RejectPDU) or isinstance(response_apdu, ErrorPDU):
             self.datagram_server.sendto(pdu.pduData, address)
         else:
